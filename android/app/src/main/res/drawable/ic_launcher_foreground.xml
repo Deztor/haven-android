@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Gold tower for Haven; fits the 66dp adaptive-icon safe zone. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:fillColor="#E9C46A"
+        android:pathData="M37,32h8v6h5v-6h8v6h5v-6h8v16h-4v34h-26v-34h-4z" />
+    <path
+        android:fillColor="#1F3A2E"
+        android:pathData="M48,82v-12a6,6 0,0 1,12 0v12z" />
+    <path
+        android:fillColor="#1F3A2E"
+        android:pathData="M51.5,52h5v9h-5z" />
+</vector>

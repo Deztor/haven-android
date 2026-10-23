@@ -1,0 +1,146 @@
+name: Android APK
+# Every change of the shell (anything but notes) builds a new APK; site changes never need one.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  pull_request:
+    paths-ignore: ['**.md']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  VERSION: ${{ github.run_number }}
+jobs:
+  build:
+    # GitHub-hosted on purpose: the PC runners have no Android SDK, and public repositories build for free.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      signed: ${{ steps.key.outputs.signed }}
+      sha256: ${{ steps.check.outputs.sha256 }}
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - run: npm ci --no-audit --no-fund
+      - name: Stamp the version Haven reads from the user agent
+        run: |
+          node -e 'const f="capacitor.config.json",c=JSON.parse(require("fs").readFileSync(f,"utf8"));c.appendUserAgent="HavenApk/"+process.env.VERSION;require("fs").writeFileSync(f,JSON.stringify(c,null,2)+"\n")'
+          npx cap sync android
+      - name: Load the signing key
+        id: key
+        if: env.PUBLISH == 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASSWORD" ]; then
+            echo "::warning::ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD are not set: the APK is built but not signed or published."
+            exit 0
+          fi
+          printf '%s' "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/haven.p12"
+          echo "ANDROID_KEYSTORE_FILE=$RUNNER_TEMP/haven.p12" >> "$GITHUB_ENV"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+      - name: Build the APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ env.PUBLISH == 'true' && secrets.ANDROID_KEYSTORE_PASSWORD || '' }}
+        run: ./gradlew --no-daemon assembleRelease -PappVersionCode="$VERSION"
+      - name: Check the APK
+        id: check
+        run: |
+          out=android/app/build/outputs/apk/release
+          ls -l "$out"
+          tools="$ANDROID_HOME/build-tools/$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -1)"
+          "$tools/aapt2" dump badging "$out"/app-release*.apk | head -3
+          if [ -n "$ANDROID_KEYSTORE_FILE" ]; then
+            "$tools/apksigner" verify --print-certs "$out/app-release.apk" | grep -i 'SHA-256'
+            cp "$out/app-release.apk" haven.apk
+            echo "sha256=$(sha256sum haven.apk | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          fi
+          rm -f "$RUNNER_TEMP/haven.p12"
+      # Through the Actions cache, not an artifact: the account's artifact storage is shared with
+      # other repositories and a full quota must not block a release.
+      - name: Hand the signed APK to the release job
+        if: steps.key.outputs.signed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: haven.apk
+          key: haven-apk-${{ github.run_id }}-${{ github.run_attempt }}
+
+  release:
+    # Only this job can write to the repository, and it runs no code from the checkout.
+    needs: build
+    if: needs.build.outputs.signed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: haven.apk
+          key: haven-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          # A re-run of only this job finds the APK of the build attempt it depends on.
+          restore-keys: haven-apk-${{ github.run_id }}-
+          fail-on-cache-miss: true
+      - name: Check it is the APK the build signed
+        env:
+          EXPECTED: ${{ needs.build.outputs.sha256 }}
+        run: echo "$EXPECTED  haven.apk" | sha256sum --check
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="apk-v$VERSION"
+          # Every release with its draft flag and whether it carries a fully uploaded APK. An API
+          # error stops the job here: «latest» is never decided on a guess.
+          releases=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" \
+            --jq '.[] | [.tag_name, .draft, ([.assets[] | select(.name == "haven.apk" and .state == "uploaded")] | length)] | @tsv')
+          newest=0
+          while IFS=$'\t' read -r name draft apks; do
+            if [[ "$name" =~ ^apk-v([0-9]+)$ ]] && [ "$draft" = false ] && [ "$apks" -gt 0 ] && [ "${BASH_REMATCH[1]}" -gt "$newest" ]; then
+              newest=${BASH_REMATCH[1]}
+            fi
+          done <<< "$releases"
+          # Only a newer build may become «latest», so a late re-run never hides a newer APK.
+          latest=true
+          if [ "$newest" -gt "$VERSION" ]; then latest=false; fi
+          existing=$(awk -F'\t' -v t="$tag" '$1 == t' <<< "$releases")
+          if [ -n "$existing" ]; then
+            IFS=$'\t' read -r _ draft apks <<< "$existing"
+            # A re-run of a complete, published release is a success, not a second release.
+            if [ "$draft" = false ] && [ "$apks" -gt 0 ]; then
+              echo "$tag is already published."
+              exit 0
+            fi
+            # An earlier attempt stopped half way (draft, or the upload broke): finish that release.
+            gh release upload "$tag" haven.apk --clobber
+            gh release edit "$tag" --draft=false --latest="$latest"
+          else
+            gh release create "$tag" haven.apk \
+              --target "$GITHUB_SHA" --latest="$latest" \
+              --title "Haven · версія $VERSION" \
+              --notes "Завантаж haven.apk на телефоні й встанови поверх попередньої версії. Постійне посилання на останню: https://github.com/$GH_REPO/releases/latest/download/haven.apk"
+          fi
+          echo "APK: https://github.com/$GH_REPO/releases/download/$tag/haven.apk (latest=$latest)" >> "$GITHUB_STEP_SUMMARY"
