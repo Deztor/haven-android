@@ -1,0 +1,14 @@
+{
+  "appId": "com.deztor.haven",
+  "appName": "Haven",
+  "webDir": "www",
+  "appendUserAgent": "HavenApk/0",
+  "server": {
+    "url": "https://warden-web.lovable.app",
+    "errorPath": "offline.html"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "webContentsDebuggingEnabled": false
+  }
+}
